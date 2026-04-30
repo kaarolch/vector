@@ -719,8 +719,12 @@ impl Aggregate {
                     }
                 }
 
-                self.event_time_prev_buckets.insert(bucket_key, bucket_map);
+                // Only `Diff` mode reads `event_time_prev_buckets` (in the
+                // flush loop above, gated on `AggregationMode::Diff`).
+                // Inserting unconditionally for other modes would leak —
+                // the entries would never be read and never be evicted.
                 if matches!(self.config.mode, AggregationMode::Diff) {
+                    self.event_time_prev_buckets.insert(bucket_key, bucket_map);
                     // Keep only a small history window to compute the previous bucket diff.
                     let min_keep = bucket_key.saturating_sub(interval_ms);
                     self.event_time_prev_buckets.retain(|&k, _| k >= min_keep);
@@ -2352,5 +2356,97 @@ interval_ms = 999999
         assert!(found_counter_a, "Should have found counter_a");
         assert!(found_counter_b, "Should have found counter_b");
         assert!(found_gauge_c, "Should have found gauge_c");
+    }
+
+    /// Regression test: `event_time_prev_buckets` is only consumed by
+    /// `AggregationMode::Diff` (read inside `flush_event_time_buckets`,
+    /// gated on the mode). Prior to the fix, the field was populated
+    /// unconditionally on every flush — and only evicted for `Diff`
+    /// mode — so non-Diff aggregators leaked one bucket's worth of
+    /// state per flush interval, indefinitely. This test runs many
+    /// flush cycles in `Auto` mode and verifies the field stays empty.
+    #[test]
+    fn event_time_non_diff_modes_do_not_retain_prev_buckets() {
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms: 10_000_u64,
+            mode: AggregationMode::Auto,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10_000,
+        })
+        .unwrap();
+
+        let base_time = DateTime::parse_from_rfc3339("2025-12-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Record + flush across 50 distinct event-time buckets. Without
+        // the fix, `event_time_prev_buckets` would accumulate 50 entries
+        // (one per flushed bucket).
+        for i in 0..50_i64 {
+            let ts = base_time + chrono::Duration::seconds(i * 10);
+            let event = make_metric_with_timestamp(
+                "leak_check_counter",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 1.0 },
+                ts,
+            );
+            agg.record(event);
+
+            let mut out = vec![];
+            agg.flush_into(&mut out);
+        }
+
+        assert_eq!(
+            0,
+            agg.event_time_prev_buckets.len(),
+            "Non-Diff modes must not retain entries in event_time_prev_buckets; \
+             found {} stale buckets after 50 flushes",
+            agg.event_time_prev_buckets.len(),
+        );
+    }
+
+    /// Companion to the test above: `Diff` mode still needs the
+    /// previous bucket to compute diffs, so it should retain a small
+    /// rolling window (one previous bucket) — not zero, and not
+    /// unboundedly many.
+    #[test]
+    fn event_time_diff_mode_retains_only_one_previous_bucket() {
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms: 10_000_u64,
+            mode: AggregationMode::Diff,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10_000,
+        })
+        .unwrap();
+
+        let base_time = DateTime::parse_from_rfc3339("2025-12-29T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        for i in 0..50_i64 {
+            let ts = base_time + chrono::Duration::seconds(i * 10);
+            let event = make_metric_with_timestamp(
+                "diff_gauge",
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: i as f64 },
+                ts,
+            );
+            agg.record(event);
+
+            let mut out = vec![];
+            agg.flush_into(&mut out);
+        }
+
+        assert!(
+            agg.event_time_prev_buckets.len() <= 2,
+            "Diff mode should retain at most a small rolling window of \
+             previous buckets (one for the next-bucket diff lookup, \
+             possibly two during the transition); found {}",
+            agg.event_time_prev_buckets.len(),
+        );
     }
 }
