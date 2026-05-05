@@ -52,26 +52,34 @@ pub struct AggregateConfig {
 
     /// Grace period for late-arriving events when using event-time aggregation.
     ///
-    /// Events with timestamps older than the watermark but within this grace period will still be accepted.
-    /// Set to 0 for strict ordering (no late events allowed).
-    /// Only applies when `time_source` is set to `EventTime`.
+    /// Each bucket is held open for this many milliseconds past the end of its window so late
+    /// events still land in the correct bucket. Once a bucket is emitted it is closed
+    /// permanently; any later events whose timestamp falls inside it are dropped and counted
+    /// via `component_discarded_events_total`.
+    ///
+    /// Set to 0 for strict ordering (no late events allowed). Only applies when `time_source`
+    /// is set to `event_time`.
     #[serde(default)]
     #[configurable(metadata(docs::examples = 0, docs::examples = 5000, docs::examples = 30000))]
     pub allowed_lateness_ms: u64,
 
     /// How to handle events with missing timestamps in event-time mode.
     ///
-    /// When `true`, events without timestamps will use the current system time as a fallback.
-    /// When `false`, events without timestamps will be dropped.
-    /// Only applies when `time_source` is set to `EventTime`.
+    /// When `true`, events without a timestamp use the current system time as a fallback.
+    /// When `false`, such events are dropped and counted via `component_discarded_events_total`.
+    ///
+    /// Only applies when `time_source` is set to `event_time`.
     #[serde(default)]
     pub use_system_time_for_missing_timestamps: bool,
 
     /// Maximum allowed time drift for future events in event-time mode.
     ///
-    /// Events with timestamps further in the future than this value will be dropped.
-    /// Set to 0 to allow events at any future time.
-    /// Only applies when `time_source` is set to `EventTime`.
+    /// Acts as a clock-skew guard: events whose timestamp is further in the future than this
+    /// many milliseconds (relative to the current system time) are dropped and counted via
+    /// `component_discarded_events_total`. Defaults to 10 seconds.
+    ///
+    /// Set to 0 to allow events at any future time. Only applies when `time_source` is set
+    /// to `event_time`.
     #[serde(default = "default_max_future_ms")]
     #[configurable(metadata(docs::examples = 0, docs::examples = 60000, docs::examples = 300000))]
     pub max_future_ms: u64,
@@ -256,23 +264,36 @@ impl Aggregate {
         })
     }
 
+    /// Start of the half-open window `[bucket_key, bucket_key + interval_ms)` containing
+    /// `timestamp`, aligned to multiples of `interval_ms` from the Unix epoch.
+    ///
+    /// Euclidean division (`div_euclid`) is required: Rust's truncating `/`
+    /// rounds toward zero, so timestamps just before the epoch (negative
+    /// millis) would incorrectly map into the non-negative bucket `[0, interval)`
+    /// instead of `[-interval, 0)`.
     const fn bucket_key(&self, timestamp: DateTime<Utc>) -> BucketKey {
         let timestamp_ms = timestamp.timestamp_millis();
         let interval_ms = self.interval.as_millis() as i64;
-        (timestamp_ms / interval_ms) * interval_ms
+        timestamp_ms.div_euclid(interval_ms).saturating_mul(interval_ms)
     }
 
+    /// Returns `true` if `bucket_key` belongs to a window that has already
+    /// been emitted and therefore must not accept any further events.
+    ///
+    /// `watermark` is the *exclusive end* of the highest bucket flushed so
+    /// far -- equivalently, the smallest `bucket_key` that is still valid to
+    /// record into. `allowed_lateness_ms` is honoured at flush time (it
+    /// delays closing the bucket); once a window has been emitted it is
+    /// closed unconditionally and late events for it are dropped.
     const fn is_too_late(&self, bucket_key: BucketKey) -> bool {
         if let Some(watermark) = self.watermark {
-            // Allow events within the grace period (allowed_lateness)
-            let grace_period_ms = self.config.allowed_lateness_ms as i64;
-            bucket_key < watermark.saturating_sub(grace_period_ms)
+            bucket_key < watermark
         } else {
             false
         }
     }
 
-    fn record(&mut self, event: Event) {
+    pub fn record(&mut self, event: Event) {
         let metric = event.into_metric();
         let timestamp = metric.timestamp();
         let (series, mut data, metadata) = metric.into_parts();
@@ -319,8 +340,12 @@ impl Aggregate {
                 return;
             }
 
-            self.record_into_bucket(bucket_key, series, data, metadata);
-            emit!(AggregateEventRecorded);
+            // `record_into_bucket` emits its own `AggregateEventDropped`
+            // telemetry when the event is incompatible with the configured
+            // mode; only count it as recorded when it actually landed.
+            if self.record_into_bucket(bucket_key, series, data, metadata) {
+                emit!(AggregateEventRecorded);
+            }
             return;
         }
         match self.config.mode {
@@ -368,24 +393,72 @@ impl Aggregate {
         emit!(AggregateEventRecorded);
     }
 
+    /// Returns `true` iff a record with the given `kind`/`value` would be
+    /// stored under `mode`. Mirrors the per-mode filters in `record_sum`,
+    /// `record_comparison`, the `Latest`/`Diff` Absolute-only path, and the
+    /// `Mean`/`Stdev` Gauge check, so the (mode, kind, value) compatibility
+    /// can be decided *before* a bucket entry is created.
+    ///
+    /// This matters because in event-time mode an empty bucket is still
+    /// considered eligible to flush and would *advance the watermark*; we
+    /// must therefore avoid materialising buckets for events that the mode
+    /// would silently no-op on, otherwise a stray incompatible event could
+    /// reject valid in-order events for earlier buckets.
+    const fn will_be_stored(mode: AggregationMode, data: &MetricData) -> bool {
+        match mode {
+            // `Auto` stores both kinds (sum incremental, latest absolute).
+            // `Count` stores both kinds; per-series kind mismatches surface
+            // later via `AggregateUpdateFailed`, but the first event for a
+            // series always lands so a bucket is never created spuriously.
+            AggregationMode::Auto | AggregationMode::Count => true,
+            AggregationMode::Sum => matches!(data.kind, MetricKind::Incremental),
+            // `Latest`/`Diff` and `Max`/`Min` only act on absolute metrics.
+            AggregationMode::Latest
+            | AggregationMode::Diff
+            | AggregationMode::Max
+            | AggregationMode::Min => matches!(data.kind, MetricKind::Absolute),
+            // `Mean`/`Stdev` only record absolute Gauges.
+            AggregationMode::Mean | AggregationMode::Stdev => {
+                matches!(data.kind, MetricKind::Absolute)
+                    && matches!(data.value, MetricValue::Gauge { value: _ })
+            }
+        }
+    }
+
+    /// Records an event-time event into the appropriate bucket. Returns `true`
+    /// if the event was stored, `false` if it was dropped because its
+    /// (kind, value) is incompatible with the configured mode (for example
+    /// an `Incremental` event arriving at a `Mean`-configured aggregator).
+    ///
+    /// Bucket entries are created lazily inside each per-mode arm so that
+    /// dropped events do not allocate or advance the watermark on flush.
+    /// The `multi_bucket` map is only touched in `Mean`/`Stdev` modes.
     fn record_into_bucket(
         &mut self,
         bucket_key: BucketKey,
         series: MetricSeries,
         data: MetricData,
         metadata: EventMetadata,
-    ) {
+    ) -> bool {
         let mode = self.config.mode;
-        let bucket = self.event_time_buckets.entry(bucket_key).or_default();
-        let multi_bucket = self.event_time_multi_buckets.entry(bucket_key).or_default();
+
+        // Drop incompatible events explicitly (and emit telemetry for them)
+        // before touching either bucket map -- see `will_be_stored`.
+        if !Self::will_be_stored(mode, &data) {
+            emit!(AggregateEventDropped {
+                reason: "Event kind/value is incompatible with the configured aggregation mode."
+            });
+            return false;
+        }
 
         match mode {
-            AggregationMode::Auto => match data.kind {
-                MetricKind::Incremental => {
-                    Self::record_sum(bucket, series, data, metadata);
-                }
-                MetricKind::Absolute => {
-                    match bucket.entry(series) {
+            AggregationMode::Auto => {
+                let bucket = self.event_time_buckets.entry(bucket_key).or_default();
+                match data.kind {
+                    MetricKind::Incremental => {
+                        Self::record_sum(bucket, series, data, metadata);
+                    }
+                    MetricKind::Absolute => match bucket.entry(series) {
                         Entry::Vacant(entry) => {
                             entry.insert((data, metadata));
                         }
@@ -399,20 +472,21 @@ impl Aggregate {
                                 (Some(_), None) => true,
                                 _ => false,
                             };
-
                             if should_replace {
                                 *entry.get_mut() = (data, metadata);
                             }
                         }
-                    }
+                    },
                 }
-            },
+            }
             AggregationMode::Sum => {
+                let bucket = self.event_time_buckets.entry(bucket_key).or_default();
                 Self::record_sum(bucket, series, data, metadata);
             }
-            AggregationMode::Latest | AggregationMode::Diff => match data.kind {
-                MetricKind::Incremental => (),
-                MetricKind::Absolute => match bucket.entry(series) {
+            AggregationMode::Latest | AggregationMode::Diff => {
+                // `data.kind == Absolute` is guaranteed by `will_be_stored`.
+                let bucket = self.event_time_buckets.entry(bucket_key).or_default();
+                match bucket.entry(series) {
                     Entry::Vacant(entry) => {
                         entry.insert((data, metadata));
                     }
@@ -424,36 +498,41 @@ impl Aggregate {
                             (Some(_), None) => true,
                             _ => false,
                         };
-
                         if should_replace {
                             *entry.get_mut() = (data, metadata);
                         }
                     }
-                },
-            },
+                }
+            }
             AggregationMode::Count => {
+                let bucket = self.event_time_buckets.entry(bucket_key).or_default();
                 Self::record_count(bucket, series, data, metadata);
             }
             AggregationMode::Max | AggregationMode::Min => {
+                let bucket = self.event_time_buckets.entry(bucket_key).or_default();
                 Self::record_comparison(bucket, series, data, metadata, mode);
             }
-            AggregationMode::Mean | AggregationMode::Stdev => match data.kind {
-                MetricKind::Incremental => (),
-                MetricKind::Absolute => {
-                    if matches!(data.value, MetricValue::Gauge { value: _ }) {
-                        match multi_bucket.entry(series) {
-                            Entry::Occupied(mut entry) => {
-                                let existing = entry.get_mut();
-                                existing.push((data, metadata));
-                            }
-                            Entry::Vacant(entry) => {
-                                entry.insert(vec![(data, metadata)]);
-                            }
-                        }
+            AggregationMode::Mean | AggregationMode::Stdev => {
+                // `will_be_stored` has already guaranteed Absolute + Gauge.
+                //
+                // Mean/Stdev write samples into `event_time_multi_buckets`;
+                // an empty entry is also placed in `event_time_buckets` so
+                // the flush loop -- which iterates `event_time_buckets.keys()`
+                // to discover eligible buckets -- picks this bucket up too.
+                self.event_time_buckets.entry(bucket_key).or_default();
+                let multi_bucket = self.event_time_multi_buckets.entry(bucket_key).or_default();
+                match multi_bucket.entry(series) {
+                    Entry::Occupied(mut entry) => {
+                        entry.get_mut().push((data, metadata));
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(vec![(data, metadata)]);
                     }
                 }
-            },
+            }
         }
+
+        true
     }
 
     fn record_sum(
@@ -541,9 +620,22 @@ impl Aggregate {
         }
     }
 
-    fn flush_into(&mut self, output: &mut Vec<Event>) {
+    pub fn flush_into(&mut self, output: &mut Vec<Event>) {
         if self.time_source == TimeSource::EventTime {
-            self.flush_event_time_buckets(output);
+            self.flush_event_time_buckets(output, false);
+        } else {
+            self.flush_system_time(output);
+        }
+    }
+
+    /// Final flush invoked when the input stream closes. In event-time mode
+    /// this drains every remaining bucket regardless of the wall-clock
+    /// predicate so that metrics in still-open windows are emitted on
+    /// shutdown or topology reload, matching system-time semantics where
+    /// `flush_system_time` always empties `self.map`.
+    fn flush_final(&mut self, output: &mut Vec<Event>) {
+        if self.time_source == TimeSource::EventTime {
+            self.flush_event_time_buckets(output, true);
         } else {
             self.flush_system_time(output);
         }
@@ -629,39 +721,68 @@ impl Aggregate {
         emit!(AggregateFlushed);
     }
 
-    fn flush_event_time_buckets(&mut self, output: &mut Vec<Event>) {
+    fn flush_event_time_buckets(&mut self, output: &mut Vec<Event>, force: bool) {
         let now = Utc::now();
         let now_ms = now.timestamp_millis();
         let interval_ms = self.interval.as_millis() as i64;
         let grace_ms = self.config.allowed_lateness_ms as i64;
 
-        // Flush Logic:
-        // A bucket [bucket_key, bucket_key + interval) is considered ready to flush if:
-        // 1. now >= bucket_key + interval + allowed_lateness (bucket end time + grace window)
+        // A bucket [bucket_key, bucket_key + interval) is eligible to flush
+        // when either:
+        //   1. `now >= bucket_key + interval + allowed_lateness` -- the
+        //      bucket has ended and its grace period has elapsed; or
+        //   2. `force` is true -- final flush on shutdown / topology reload,
+        //      which drains every remaining bucket so in-flight events are
+        //      not silently dropped.
         //
-        // Watermark tracking is still used for late-event rejection in `is_too_late()`.
+        // The watermark advanced below gates late-event rejection via
+        // `is_too_late()`.
         let buckets_to_flush: Vec<BucketKey> = self
             .event_time_buckets
             .keys()
-            .filter(|&&bucket_key| now_ms >= bucket_key + interval_ms + grace_ms)
+            .filter(|&&bucket_key| force || now_ms >= bucket_key + interval_ms + grace_ms)
             .copied()
             .collect();
 
         for bucket_key in buckets_to_flush {
             if let Some(bucket_map) = self.event_time_buckets.remove(&bucket_key) {
-                for (series, entry) in bucket_map.clone().into_iter() {
-                    let mut metric = Metric::from_parts(series, entry.0, entry.1);
+                // Diff mode must retain `bucket_map` to subtract against the
+                // next flush, so it iterates by reference and per-entry clones
+                // only what `Metric::from_parts` consumes. Other modes never
+                // touch the map again, so they consume it directly — avoiding
+                // the full `HashMap` allocation and per-entry copy that the
+                // previous unconditional `bucket_map.clone()` performed on
+                // every flush (significant under high-cardinality event-time
+                // workloads).
+                if matches!(self.config.mode, AggregationMode::Diff) {
                     let prev_bucket_key = bucket_key.saturating_sub(interval_ms);
-                    if matches!(self.config.mode, AggregationMode::Diff)
-                        && let Some(prev_bucket) =
+                    for (series, entry) in &bucket_map {
+                        let mut metric = Metric::from_parts(
+                            series.clone(),
+                            entry.0.clone(),
+                            entry.1.clone(),
+                        );
+                        if let Some(prev_bucket) =
                             self.event_time_prev_buckets.get(&prev_bucket_key)
-                        && let Some(prev_entry) = prev_bucket.get(metric.series())
-                        && metric.data().kind == prev_entry.0.kind
-                        && !metric.subtract(&prev_entry.0)
-                    {
-                        emit!(AggregateUpdateFailed);
+                            && let Some(prev_entry) = prev_bucket.get(metric.series())
+                            && metric.data().kind == prev_entry.0.kind
+                            && !metric.subtract(&prev_entry.0)
+                        {
+                            emit!(AggregateUpdateFailed);
+                        }
+                        output.push(Event::Metric(metric));
                     }
-                    output.push(Event::Metric(metric));
+
+                    self.event_time_prev_buckets.insert(bucket_key, bucket_map);
+                    // Keep only a small rolling window for diffing against the
+                    // immediately preceding bucket.
+                    let min_keep = bucket_key.saturating_sub(interval_ms);
+                    self.event_time_prev_buckets.retain(|&k, _| k >= min_keep);
+                } else {
+                    for (series, entry) in bucket_map {
+                        let metric = Metric::from_parts(series, entry.0, entry.1);
+                        output.push(Event::Metric(metric));
+                    }
                 }
 
                 if let Some(multi_bucket) = self.event_time_multi_buckets.remove(&bucket_key) {
@@ -731,9 +852,12 @@ impl Aggregate {
                 }
             }
 
-            // Update watermark to the highest flushed bucket
-            if self.watermark.is_none_or(|w| bucket_key > w) {
-                self.watermark = Some(bucket_key);
+            // Advance the watermark to the *exclusive end* of the highest
+            // flushed bucket so subsequent events for that window (or any
+            // earlier one) are rejected by `is_too_late`.
+            let bucket_end = bucket_key.saturating_add(interval_ms);
+            if self.watermark.is_none_or(|w| bucket_end > w) {
+                self.watermark = Some(bucket_end);
             }
         }
 
@@ -764,7 +888,10 @@ impl TaskTransform<Event> for Aggregate {
                     maybe_event = input_rx.next() => {
                         match maybe_event {
                             None => {
-                                self.flush_into(&mut output);
+                                // Drain any remaining event-time buckets on
+                                // shutdown so in-flight metrics still flow
+                                // downstream.
+                                self.flush_final(&mut output);
                                 done = true;
                             }
                             Some(event) => self.record(event),
@@ -1674,6 +1801,40 @@ interval_ms = 999999
         }
     }
 
+    /// Rust truncating `/` rounds toward zero, so `-1 / 10000 == 0` and the
+    /// bucket anchor would wrongly be `0`. Euclidean alignment places
+    /// `-1ms` in `[-interval_ms, 0)` anchored at `-interval_ms`.
+    #[test]
+    fn event_time_pre_epoch_buckets_use_floor_division() {
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms: 10_000_u64,
+            mode: AggregationMode::Auto,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10_000,
+        })
+        .unwrap();
+
+        let ts = Utc
+            .timestamp_millis_opt(-1)
+            .latest()
+            .expect("valid millis near epoch");
+
+        agg.record(make_metric_with_timestamp(
+            "pre_epoch",
+            MetricKind::Incremental,
+            MetricValue::Counter { value: 1.0 },
+            ts,
+        ));
+
+        assert_eq!(
+            agg.event_time_buckets.keys().next().copied(),
+            Some(-10_000),
+            "-1 ms must bucket to [-10000, 0), not [0, 10000)"
+        );
+    }
+
     #[test]
     fn event_time_out_of_order_rejection() {
         let mut agg = Aggregate::new(&AggregateConfig {
@@ -1872,6 +2033,102 @@ interval_ms = 999999
     }
 
     #[test]
+    fn event_time_mean_happy_path() {
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms: 10000_u64,
+            mode: AggregationMode::Mean,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10000,
+        })
+        .unwrap();
+
+        let base_time = DateTime::parse_from_rfc3339("2025-12-29T11:00:20Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Three absolute gauges for the same series in one event-time bucket.
+        agg.record(make_metric_with_timestamp(
+            "gauge_mean_et",
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: 32.0 },
+            base_time + chrono::Duration::seconds(1),
+        ));
+        agg.record(make_metric_with_timestamp(
+            "gauge_mean_et",
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: 82.0 },
+            base_time + chrono::Duration::seconds(2),
+        ));
+        agg.record(make_metric_with_timestamp(
+            "gauge_mean_et",
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: 51.0 },
+            base_time + chrono::Duration::seconds(3),
+        ));
+
+        let mut out = vec![];
+        agg.flush_into(&mut out);
+        assert_eq!(1, out.len());
+        assert_eq!(
+            out[0].as_metric().series().name.name.as_str(),
+            "gauge_mean_et"
+        );
+        if let MetricValue::Gauge { value } = out[0].as_metric().value() {
+            assert!(
+                (*value - 55.0).abs() < 1e-9,
+                "expected mean 55.0, got {value}"
+            );
+        } else {
+            panic!("Expected Gauge metric value");
+        }
+    }
+
+    #[test]
+    fn event_time_stdev_happy_path() {
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms: 10000_u64,
+            mode: AggregationMode::Stdev,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10000,
+        })
+        .unwrap();
+
+        let base_time = DateTime::parse_from_rfc3339("2025-12-29T11:00:25Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let values = [25.0f64, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0];
+        for (i, &v) in values.iter().enumerate() {
+            agg.record(make_metric_with_timestamp(
+                "gauge_stdev_et",
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: v },
+                base_time + chrono::Duration::milliseconds(100 * i as i64),
+            ));
+        }
+
+        let mut out = vec![];
+        agg.flush_into(&mut out);
+        assert_eq!(1, out.len());
+        assert_eq!(
+            out[0].as_metric().series().name.name.as_str(),
+            "gauge_stdev_et"
+        );
+        if let MetricValue::Gauge { value } = out[0].as_metric().value() {
+            assert!(
+                (*value - 10.0).abs() < 1e-9,
+                "expected stdev 10.0, got {value}"
+            );
+        } else {
+            panic!("Expected Gauge metric value");
+        }
+    }
+
+    #[test]
     fn event_time_diff_uses_previous_bucket() {
         let mut agg = Aggregate::new(&AggregateConfig {
             interval_ms: 10000_u64, // 10 seconds
@@ -1980,7 +2237,12 @@ interval_ms = 999999
     }
 
     #[test]
-    fn event_time_allowed_lateness_accepts_within_grace_rejects_outside() {
+    fn event_time_closed_buckets_are_rejected_regardless_of_grace() {
+        // `allowed_lateness_ms` controls only when a bucket is *closed* -- it delays
+        // the initial flush so late-arriving events still land in the correct bucket.
+        // Once a bucket has been emitted, however, a late event for that bucket
+        // (or any earlier bucket) must be rejected: accepting it would re-create the
+        // bucket and emit a duplicate partial aggregate for an already-closed window.
         let interval_ms = 10_000_u64;
         let allowed_lateness_ms = 10_000_u64;
 
@@ -1996,70 +2258,216 @@ interval_ms = 999999
 
         let now_ms = Utc::now().timestamp_millis();
         let interval_i64 = interval_ms as i64;
-        let grace_i64 = allowed_lateness_ms as i64;
 
         let current_bucket_key = (now_ms / interval_i64) * interval_i64;
-
-        // Choose buckets far enough in the past that they flush immediately when present
-        // in `event_time_buckets`, but still distinct enough to test watermark+grace logic.
+        // Far enough in the past that the wall-clock + grace flush predicate is
+        // satisfied for the initial bucket.
         let watermark_bucket_key = current_bucket_key - interval_i64 * 5;
-        let accept_bucket_key = watermark_bucket_key - grace_i64; // exactly at grace boundary
-        let reject_bucket_key = watermark_bucket_key - grace_i64 - interval_i64; // beyond grace
+        // Same bucket that just got flushed.
+        let same_bucket_late_key = watermark_bucket_key;
+        // Earlier bucket within the grace window (would have been accepted under the
+        // pre-fix semantics, must now be rejected).
+        let earlier_within_grace_key = watermark_bucket_key - interval_i64;
+        // The *next* (future) open bucket -- still admissible.
+        let next_open_bucket_key = watermark_bucket_key + interval_i64;
 
-        let ts_in_watermark_bucket = Utc
-            .timestamp_millis_opt(watermark_bucket_key + interval_i64 / 2)
-            .latest()
-            .unwrap();
-        let ts_in_accept_bucket = Utc
-            .timestamp_millis_opt(accept_bucket_key + interval_i64 / 2)
-            .latest()
-            .unwrap();
-        let ts_in_reject_bucket = Utc
-            .timestamp_millis_opt(reject_bucket_key + interval_i64 / 2)
-            .latest()
-            .unwrap();
+        let ts = |k: i64| {
+            Utc.timestamp_millis_opt(k + interval_i64 / 2)
+                .latest()
+                .unwrap()
+        };
 
-        // Step 1: flush the watermark bucket so watermark becomes `watermark_bucket_key`.
-        let initial = make_metric_with_timestamp(
-            "gauge_lateness_boundary",
+        // Flush the initial bucket so the watermark advances past it.
+        agg.record(make_metric_with_timestamp(
+            "gauge_closed_bucket_rejection",
             MetricKind::Absolute,
             MetricValue::Gauge { value: 1.0 },
-            ts_in_watermark_bucket,
-        );
-        agg.record(initial);
+            ts(watermark_bucket_key),
+        ));
         let mut out = vec![];
         agg.flush_into(&mut out);
         assert_eq!(1, out.len());
-
+        assert_eq!(
+            agg.watermark,
+            Some(watermark_bucket_key + interval_i64),
+            "watermark must point to the END (exclusive) of the flushed bucket"
+        );
         out.clear();
 
-        // Step 2: record one event inside grace (should be accepted) and one beyond grace
-        // (should be rejected).
-        let accepted = make_metric_with_timestamp(
-            "gauge_lateness_boundary",
+        // Late events for the just-flushed bucket and any earlier bucket within
+        // the grace window must be rejected.
+        agg.record(make_metric_with_timestamp(
+            "gauge_closed_bucket_rejection",
             MetricKind::Absolute,
-            MetricValue::Gauge { value: 2.0 },
-            ts_in_accept_bucket,
-        );
-        let rejected = make_metric_with_timestamp(
-            "gauge_lateness_boundary",
+            MetricValue::Gauge { value: 99.0 },
+            ts(same_bucket_late_key),
+        ));
+        agg.record(make_metric_with_timestamp(
+            "gauge_closed_bucket_rejection",
             MetricKind::Absolute,
-            MetricValue::Gauge { value: 3.0 },
-            ts_in_reject_bucket,
-        );
-
-        agg.record(accepted);
-        agg.record(rejected);
+            MetricValue::Gauge { value: 99.0 },
+            ts(earlier_within_grace_key),
+        ));
         agg.flush_into(&mut out);
+        assert!(
+            out.is_empty(),
+            "events for already-closed buckets must not produce a duplicate aggregate"
+        );
 
-        // Only the accepted bucket should produce an output metric.
-        assert_eq!(1, out.len());
-        let metric = out[0].as_metric();
-        if let MetricValue::Gauge { value } = metric.value() {
-            assert_eq!(*value, 2.0);
+        // An event for the next open bucket must still be accepted.
+        agg.record(make_metric_with_timestamp(
+            "gauge_closed_bucket_rejection",
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: 7.0 },
+            ts(next_open_bucket_key),
+        ));
+        agg.flush_into(&mut out);
+        assert_eq!(1, out.len(), "next open bucket must still flush");
+        if let MetricValue::Gauge { value } = out[0].as_metric().value() {
+            assert_eq!(*value, 7.0);
         } else {
             panic!("Expected Gauge metric value");
         }
+    }
+
+    /// In any non-`Diff` mode the `event_time_prev_buckets` map is never
+    /// consulted, so it must also never be populated -- otherwise long-running
+    /// aggregators would grow proportional to
+    /// (unique series in interval) × (intervals since startup).
+    #[test]
+    fn event_time_non_diff_modes_do_not_retain_prev_buckets() {
+        let interval_ms = 10_000_u64;
+
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms,
+            mode: AggregationMode::Auto,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10000,
+        })
+        .unwrap();
+
+        let now_ms = Utc::now().timestamp_millis();
+        let interval_i64 = interval_ms as i64;
+        // Use buckets far in the past so each one flushes on the first call.
+        let mut bucket_key = (now_ms / interval_i64) * interval_i64 - interval_i64 * 100;
+
+        for _ in 0..50 {
+            let ts = Utc
+                .timestamp_millis_opt(bucket_key + interval_i64 / 2)
+                .latest()
+                .unwrap();
+            agg.record(make_metric_with_timestamp(
+                "leak_probe",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 1.0 },
+                ts,
+            ));
+            let mut out = vec![];
+            agg.flush_into(&mut out);
+            assert_eq!(1, out.len(), "each bucket should flush exactly one metric");
+            // Step forward by one interval so the next iteration uses a fresh bucket.
+            bucket_key += interval_i64;
+        }
+
+        assert_eq!(
+            agg.event_time_prev_buckets.len(),
+            0,
+            "non-Diff mode must not retain any previous bucket"
+        );
+    }
+
+    /// `Diff` mode needs the previous bucket to compute deltas, but the
+    /// rolling window must stay bounded rather than grow with every flush.
+    #[test]
+    fn event_time_diff_mode_retains_only_bounded_prev_buckets() {
+        let interval_ms = 10_000_u64;
+
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms,
+            mode: AggregationMode::Diff,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10000,
+        })
+        .unwrap();
+
+        let now_ms = Utc::now().timestamp_millis();
+        let interval_i64 = interval_ms as i64;
+        let mut bucket_key = (now_ms / interval_i64) * interval_i64 - interval_i64 * 100;
+
+        for _ in 0..50 {
+            let ts = Utc
+                .timestamp_millis_opt(bucket_key + interval_i64 / 2)
+                .latest()
+                .unwrap();
+            agg.record(make_metric_with_timestamp(
+                "diff_probe",
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: 1.0 },
+                ts,
+            ));
+            let mut out = vec![];
+            agg.flush_into(&mut out);
+            bucket_key += interval_i64;
+        }
+
+        assert!(
+            agg.event_time_prev_buckets.len() <= 2,
+            "Diff mode must keep at most a small rolling window of previous buckets, \
+             got {}",
+            agg.event_time_prev_buckets.len()
+        );
+    }
+
+    /// When the input stream closes, every still-open event-time bucket must
+    /// be drained so in-flight metrics are not silently dropped on shutdown
+    /// or topology reload (matching system-time semantics, where
+    /// `flush_system_time` always empties the entire map).
+    #[tokio::test]
+    async fn event_time_drains_open_buckets_on_shutdown() {
+        // Long interval and large grace so the bucket is *not* eligible for the
+        // wall-clock flush during the test -- the only way it gets emitted is
+        // via the final-flush shutdown path.
+        let agg = toml::from_str::<AggregateConfig>(
+            r#"
+interval_ms = 600000
+allowed_lateness_ms = 600000
+time_source = "EventTime"
+"#,
+        )
+        .unwrap()
+        .build(&TransformContext::default())
+        .await
+        .unwrap()
+        .into_task();
+
+        let event = make_metric_with_timestamp(
+            "shutdown_drain_probe",
+            MetricKind::Incremental,
+            MetricValue::Counter { value: 41.0 },
+            Utc::now(),
+        );
+
+        let in_stream = Box::pin(stream::iter(vec![event]));
+        let mut out_stream = agg.transform_events(in_stream);
+
+        let mut count = 0_u8;
+        while let Some(ev) = out_stream.next().await {
+            count += 1;
+            assert_eq!(ev.as_metric().series().name.name.as_str(), "shutdown_drain_probe");
+            if let MetricValue::Counter { value } = ev.as_metric().value() {
+                assert_eq!(*value, 41.0);
+            } else {
+                panic!("Expected Counter metric value from drained bucket");
+            }
+        }
+        assert_eq!(
+            count, 1,
+            "open event-time bucket must be drained when the input stream closes"
+        );
     }
 
     #[test]
@@ -2160,6 +2568,91 @@ interval_ms = 999999
             assert_eq!(*value, 42.0, "First bucket in Diff emits the raw value");
         } else {
             panic!("Expected Gauge metric value");
+        }
+    }
+
+    /// Diff mode with several distinct series in the same bucket: every
+    /// series must be emitted on the first flush and every series must be
+    /// retained in `event_time_prev_buckets` so the next bucket's flush can
+    /// subtract per-series. Existing Diff tests only exercise one series per
+    /// bucket, so they would not catch a regression in the multi-series
+    /// `&bucket_map` iteration / move-into-prev-buckets path.
+    #[test]
+    fn event_time_diff_multiple_series_same_bucket() {
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms: 10000_u64,
+            mode: AggregationMode::Diff,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            max_future_ms: 10000,
+        })
+        .unwrap();
+
+        let base_time = DateTime::parse_from_rfc3339("2025-12-29T11:00:20Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next_bucket_time = base_time + chrono::Duration::seconds(15);
+
+        let bucket1: Vec<(&str, f64)> = vec![("series_a", 10.0), ("series_b", 20.0), ("series_c", 5.0)];
+        let bucket2: Vec<(&str, f64)> = vec![("series_a", 25.0), ("series_b", 22.0), ("series_c", 5.0)];
+
+        for (name, value) in &bucket1 {
+            agg.record(make_metric_with_timestamp(
+                name,
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: *value },
+                base_time,
+            ));
+        }
+        for (name, value) in &bucket2 {
+            agg.record(make_metric_with_timestamp(
+                name,
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: *value },
+                next_bucket_time,
+            ));
+        }
+
+        let mut out = vec![];
+        agg.flush_into(&mut out);
+
+        // Three series x two buckets = six emitted metrics.
+        assert_eq!(6, out.len(), "every series in every flushed bucket should emit");
+
+        // Group emitted gauges by series name (preserving emission order).
+        // Per series we expect [bucket1_raw, bucket2_delta] -- the first flush
+        // emits the raw value (no prior bucket exists) and the second flush
+        // emits `current - prev`. If the multi-series Diff path failed to
+        // retain every series in `event_time_prev_buckets`, the second-bucket
+        // emission would be the raw value instead of the delta.
+        let mut by_series: std::collections::HashMap<String, Vec<f64>> = Default::default();
+        for event in out {
+            let metric = event.as_metric();
+            let name = metric.series().name.name.clone();
+            if let MetricValue::Gauge { value } = metric.value() {
+                by_series.entry(name).or_default().push(*value);
+            } else {
+                panic!("expected Gauge value");
+            }
+        }
+
+        let prev: std::collections::HashMap<&str, f64> = bucket1.iter().copied().collect();
+        for (name, raw2) in &bucket2 {
+            let raw1 = prev[name];
+            let expected_delta = raw2 - raw1;
+            let emissions = by_series
+                .get(*name)
+                .unwrap_or_else(|| panic!("no emissions for {name}"));
+            assert_eq!(2, emissions.len(), "{name}: expected one emission per bucket");
+            assert!(
+                emissions.iter().any(|v| (v - raw1).abs() < 1e-9),
+                "{name}: missing bucket1 raw={raw1}, got {emissions:?}"
+            );
+            assert!(
+                emissions.iter().any(|v| (v - expected_delta).abs() < 1e-9),
+                "{name}: missing bucket2 delta={expected_delta}, got {emissions:?}"
+            );
         }
     }
 
@@ -2448,5 +2941,101 @@ interval_ms = 999999
              possibly two during the transition); found {}",
             agg.event_time_prev_buckets.len(),
         );
+    /// An event whose (kind, value) is incompatible with the configured
+    /// aggregation mode (for example an `Incremental` event arriving at a
+    /// `Mean`-configured aggregator) is dropped explicitly:
+    ///
+    ///   * No bucket is created in either `event_time_buckets` or
+    ///     `event_time_multi_buckets`.
+    ///   * The watermark is unaffected, so a subsequent valid event for an
+    ///     earlier bucket is still accepted.
+    ///
+    /// This guards against a stray no-op event silently rejecting valid
+    /// in-order data for earlier windows.
+    #[test]
+    fn event_time_discarded_events_do_not_advance_watermark() {
+        let interval_ms = 10_000_u64;
+
+        let mut agg = Aggregate::new(&AggregateConfig {
+            interval_ms,
+            mode: AggregationMode::Mean,
+            time_source: TimeSource::EventTime,
+            allowed_lateness_ms: 0,
+            use_system_time_for_missing_timestamps: false,
+            // Generous future allowance so the stray event isn't rejected by
+            // `max_future_ms` -- we want it to fail the *mode* compatibility
+            // check, not the future check.
+            max_future_ms: 600_000,
+        })
+        .unwrap();
+
+        let now_ms = Utc::now().timestamp_millis();
+        let interval_i64 = interval_ms as i64;
+
+        // Two buckets far enough in the past that the wall-clock predicate
+        // would flush them.
+        let stray_bucket = (now_ms / interval_i64) * interval_i64 - interval_i64 * 100;
+        let earlier_bucket = stray_bucket - interval_i64;
+
+        let stray_ts = Utc
+            .timestamp_millis_opt(stray_bucket + interval_i64 / 2)
+            .latest()
+            .unwrap();
+        let earlier_ts = Utc
+            .timestamp_millis_opt(earlier_bucket + interval_i64 / 2)
+            .latest()
+            .unwrap();
+
+        // An Incremental event in `Mean` mode is incompatible and must be
+        // dropped without leaving any bucket behind.
+        let stray = make_metric_with_timestamp(
+            "watermark_probe",
+            MetricKind::Incremental,
+            MetricValue::Counter { value: 1.0 },
+            stray_ts,
+        );
+        agg.record(stray);
+
+        assert!(
+            agg.event_time_buckets.is_empty(),
+            "stray Incremental event in Mean mode must NOT create an event_time_buckets entry"
+        );
+        assert!(
+            agg.event_time_multi_buckets.is_empty(),
+            "stray Incremental event in Mean mode must NOT create an event_time_multi_buckets entry"
+        );
+
+        // Flushing must not advance the watermark, because nothing was recorded.
+        let mut out = vec![];
+        agg.flush_into(&mut out);
+        assert_eq!(out.len(), 0, "stray event must produce no flush output");
+        assert!(
+            agg.watermark.is_none(),
+            "watermark must remain None when no real data has been flushed"
+        );
+
+        // A valid Absolute Gauge event for an EARLIER bucket must still be
+        // accepted -- a stray no-op event must not cause the watermark to
+        // reject otherwise-valid data.
+        let valid = make_metric_with_timestamp(
+            "watermark_probe",
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: 42.0 },
+            earlier_ts,
+        );
+        agg.record(valid);
+
+        out.clear();
+        agg.flush_into(&mut out);
+        assert_eq!(
+            out.len(),
+            1,
+            "valid earlier event must not be rejected by a stray-event watermark"
+        );
+        if let MetricValue::Gauge { value } = out[0].as_metric().value() {
+            assert_eq!(*value, 42.0);
+        } else {
+            panic!("Expected Gauge metric value");
+        }
     }
 }
